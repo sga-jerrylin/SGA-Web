@@ -2421,6 +2421,778 @@ def chinese_search():
         }), 500
 
 
+@app.route('/global_search', methods=['GET', 'POST'])
+def global_search():
+    """全量全域搜索API
+
+    默认使用当前实例中所有可用搜索引擎。
+    可用于中文引擎受代理影响不可用时的兜底查询。
+
+    参数:
+    - q: 搜索关键词 (必需)
+    - limit: 返回结果数量限制 (可选，默认20，最大100)
+    - engines: 指定搜索引擎 (可选，默认全部可用引擎)
+    - sort_by_time: 是否按时间排序 (可选，默认true)
+    """
+    # 强制使用JSON格式
+    output_format = 'json'
+
+    # 检查是否有查询参数
+    query = sxng_request.form.get('q') or sxng_request.args.get('q')
+    if not query:
+        return jsonify({
+            'error': 'No query provided',
+            'message': '请提供搜索关键词'
+        }), 400
+
+    # 清理查询字符串，移除非法字符
+    query = _clean_query_string(query)
+
+    # 获取返回条数限制
+    limit = sxng_request.form.get('limit') or sxng_request.args.get('limit')
+    if limit:
+        try:
+            limit = int(limit)
+            limit = max(1, min(100, limit))
+        except ValueError:
+            limit = 20
+    else:
+        limit = 20
+
+    # 获取指定搜索引擎；若未指定，使用全部可用引擎
+    specified_engines = sxng_request.form.get('engines') or sxng_request.args.get('engines')
+    if specified_engines:
+        specified_engines = [e.strip() for e in specified_engines.split(',') if e.strip()]
+    else:
+        specified_engines = list(engines.keys())
+
+    # 获取排序参数（默认 true）
+    sort_by_time_param = sxng_request.form.get('sort_by_time') or sxng_request.args.get('sort_by_time')
+    if sort_by_time_param is None:
+        sort_by_time = True
+    else:
+        sort_by_time = str(sort_by_time_param).lower() in ['true', '1', 'yes']
+
+    try:
+        # 创建一个包含查询参数的form对象
+        from werkzeug.datastructures import MultiDict
+        form_data = MultiDict()
+        form_data['q'] = query
+        form_data['format'] = 'json'
+        if limit:
+            form_data['pageno'] = '1'
+
+        # 获取搜索查询对象
+        search_query, raw_text_query, _, _, selected_locale = get_search_query_from_webapp(
+            sxng_request.preferences, form_data
+        )
+
+        # 设置返回条数
+        search_query.pageno = 1
+
+        # 重写engineref_list，包含全量可用引擎或指定引擎
+        from searx.search.models import EngineRef
+        global_engine_refs = []
+        valid_engine_names = []
+
+        for engine_name in specified_engines:
+            if engine_name in engines:
+                try:
+                    default_category = engines[engine_name].categories[0]
+                except Exception:
+                    default_category = 'general'
+                global_engine_refs.append(EngineRef(engine_name, default_category))
+                valid_engine_names.append(engine_name)
+
+        # 如果没有可用引擎，返回错误
+        if not global_engine_refs:
+            return jsonify({
+                'error': 'No engines available',
+                'message': '没有可用搜索引擎',
+                'available_engines': list(engines.keys())
+            }), 503
+
+        # 替换搜索引擎列表
+        search_query.engineref_list = global_engine_refs
+
+        # 解析 debug_score（用于缓存键与可选分数透出）
+        debug_score = sxng_request.form.get('debug_score') or sxng_request.args.get('debug_score')
+        debug_score = bool(debug_score and str(debug_score).lower() in ['true', '1', 'yes'])
+
+        # 缓存键（全量引擎列表较长，使用签名避免键过长）
+        import hashlib
+        engine_sig = hashlib.sha1(','.join(valid_engine_names).encode('utf-8')).hexdigest()[:12]
+        cache_key = (
+            f"global::{query}::p1::eng={engine_sig}::count={len(valid_engine_names)}"
+            f"::limit={limit}::time={int(bool(sort_by_time))}::debug={int(debug_score)}"
+        )
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return Response(cached, mimetype='application/json')
+
+        # 执行搜索，带重试机制
+        results = []
+        max_retries = 3
+        retry_count = 0
+
+        while retry_count < max_retries and not results:
+            search_obj = searx.search.SearchWithPlugins(search_query, sxng_request, sxng_request.user_plugins)
+            result_container = search_obj.search()
+            results = result_container.get_ordered_results() or []
+
+            if not results:
+                retry_count += 1
+                if retry_count < max_retries:
+                    import time
+                    time.sleep(0.5 * retry_count)
+                    logger.warning(f'Global search returned empty results, retrying ({retry_count}/{max_retries})')
+                else:
+                    logger.warning('Global search failed after all retries, returning empty results')
+
+        # 列表级去重/清洗/排序/重排
+        results = _dedupe_list_for_web(results)
+        results = _filter_low_relevance_for_web(query, results, min_score=0.1, is_web_interface=False)
+        try:
+            if _es_ensure_index('sga'):
+                _es_bulk_index(results, 'sga')
+                scores = _es_rerank(query, 'sga')
+                if scores:
+                    results.sort(key=lambda x: scores.get(_get_field(x, 'url') or '', 0), reverse=True)
+        except Exception:
+            pass
+        results = _re_rank_results_for_web_list(query, results, keep_time_bias=True)
+        if sort_by_time:
+            results = _sort_results_list_by_time(results)
+
+        # 截断到 limit
+        try:
+            if limit:
+                results = results[:int(limit)]
+        except Exception:
+            pass
+
+        # 将排序后的结果写回容器供 JSON 输出
+        try:
+            result_container._main_results_sorted = results  # noqa: SLF001
+        except Exception:
+            pass
+
+        # 富化参数解析与执行
+        expand = (sxng_request.form.get('expand') or sxng_request.args.get('expand') or 'meta').lower()
+        enrich_top_k = int(sxng_request.form.get('enrich_top_k') or sxng_request.args.get('enrich_top_k') or 6)
+        enrich_timeout_ms = int(sxng_request.form.get('enrich_timeout_ms') or sxng_request.args.get('enrich_timeout_ms') or 1200)
+        enrich_per_req_ms = int(sxng_request.form.get('enrich_per_req_ms') or sxng_request.args.get('enrich_per_req_ms') or 800)
+        max_article_chars = int(sxng_request.form.get('max_article_chars') or sxng_request.args.get('max_article_chars') or 1500)
+        include_param = sxng_request.form.get('include') or sxng_request.args.get('include') or ''
+        include_fields = set([s.strip() for s in include_param.split(',') if s.strip()]) if include_param else None
+
+        # 仅对 Top-K 且排除聚合域并发富化
+        urls = []
+        for r in results:
+            u = _get_field(r, 'url') or ''
+            if not u:
+                continue
+            if _host(u) in _AGG_DOMAINS:
+                continue
+            urls.append(u)
+            if len(urls) >= enrich_top_k:
+                break
+        url2enriched = _enrich_urls(
+            urls,
+            expand=expand,
+            top_k=enrich_top_k,
+            budget_ms=enrich_timeout_ms,
+            per_req_timeout=max(0.2, min(2.0, enrich_per_req_ms / 1000.0)),
+            max_article_chars=max_article_chars,
+        )
+
+        # 返回JSON响应并合并富化字段
+        response = webutils.get_json_response(search_query, result_container)
+        response = _apply_enrichment_to_json(response, url2enriched, include_fields, query)
+        _cache_set(cache_key, response)
+        return Response(response, mimetype='application/json')
+
+    except SearxParameterException as e:
+        logger.exception('global search error: SearxParameterException')
+        return jsonify({
+            'error': 'Search parameter error',
+            'message': str(e.message)
+        }), 400
+    except Exception as e:  # pylint: disable=broad-except
+        logger.exception('global search error', exc_info=True)
+        return jsonify({
+            'error': 'Internal search error',
+            'message': '搜索过程中发生错误'
+        }), 500
+
+
+# -------------------------
+# Agent API v1 — 面向 AI Agent 的统一搜索接口
+# -------------------------
+
+import uuid as _uuid
+from searx.query_rewriter import rewrite_query, get_hotwords_status
+from searx.result_fusion import rrf_fuse
+from searx.time_scoring import time_bonus as _time_bonus_fn
+
+# Reranker 微服务地址（可选，设置后启用交叉编码器重排）
+_RERANKER_URL = os.environ.get('RERANKER_URL', '')  # e.g. http://reranker:8765
+
+_PRESET_ENGINES = {
+    'chinese': ['sogou', 'baidu', '360search', 'wechat'],
+    'wechat': ['wechat', 'sogou wechat'],
+    'general': None,
+}
+
+_DEPTH_PROFILES = {
+    'basic': {
+        'expand': 'meta',
+        'enrich_top_k': 0,
+        'enrich_timeout_ms': 0,
+        'enrich_per_req_ms': 0,
+        'max_article_chars': 0,
+    },
+    'enriched': {
+        'expand': 'article',
+        'enrich_top_k': 5,
+        'enrich_timeout_ms': 2500,
+        'enrich_per_req_ms': 1000,
+        'max_article_chars': 2000,
+    },
+}
+
+
+def _agent_response_envelope(
+    status: str,
+    request_id: str = None,
+    timing: dict = None,
+    query_info: dict = None,
+    engines_status: dict = None,
+    results: list = None,
+    total_results: int = 0,
+    suggestions: list = None,
+    error: dict = None,
+) -> dict:
+    """构造统一的 Agent API 响应信封"""
+    envelope = {
+        "status": status,
+        "request_id": request_id or f"req_{_uuid.uuid4().hex[:16]}",
+        "timing": timing or {},
+    }
+    if status == "ok":
+        envelope["query"] = query_info or {}
+        envelope["engines_status"] = engines_status or {}
+        envelope["results"] = results or []
+        envelope["total_results"] = total_results
+        envelope["suggestions"] = suggestions or []
+    else:
+        envelope["error"] = error or {}
+    return envelope
+
+
+def _single_query_search(
+    query: str,
+    engine_refs: list,
+    max_retries: int = 3,
+) -> tuple[list, object]:
+    """对单个查询执行搜索，返回 (results, result_container)"""
+    from werkzeug.datastructures import MultiDict
+
+    form_data = MultiDict()
+    form_data['q'] = query
+    form_data['format'] = 'json'
+    form_data['pageno'] = '1'
+
+    search_query, raw_text_query, _, _, selected_locale = get_search_query_from_webapp(
+        sxng_request.preferences, form_data
+    )
+    search_query.pageno = 1
+    search_query.engineref_list = list(engine_refs)
+
+    results = []
+    result_container = None
+    retry_count = 0
+
+    while retry_count < max_retries and not results:
+        search_obj = searx.search.SearchWithPlugins(search_query, sxng_request, sxng_request.user_plugins)
+        result_container = search_obj.search()
+        results = result_container.get_ordered_results() or []
+        if not results:
+            retry_count += 1
+            if retry_count < max_retries:
+                time.sleep(0.3 * retry_count)
+
+    return results, result_container
+
+
+def _call_reranker(query: str, documents: list[str], top_k: int = 20) -> list[int] | None:
+    """调用外部 BGE-Reranker 微服务，返回重排后的索引列表"""
+    if not _RERANKER_URL:
+        return None
+    try:
+        import requests as _rr
+        resp = _rr.post(
+            f'{_RERANKER_URL.rstrip("/")}/rerank',
+            json={'query': query, 'documents': documents, 'top_k': top_k},
+            timeout=3,
+        )
+        if resp.ok:
+            data = resp.json()
+            return [r['index'] for r in data.get('results', [])]
+    except Exception as e:
+        logger.warning(f'[RERANKER] Call failed: {e}')
+    return None
+
+
+def _do_search_core(
+    query: str,
+    engine_names: list[str],
+    limit: int = 10,
+    sort_by_time: bool = True,
+    depth: str = "basic",
+) -> tuple[list, dict, list, dict]:
+    """
+    核心搜索逻辑，返回 (results_list, engines_status, suggestions, timing_partial)
+
+    优化流程：
+    1. 查询改写 → 生成多个查询变体
+    2. 多变体并行搜索 → RRF 融合
+    3. 去重 + 过滤 + ES 重排
+    4. 改进的时间评分（多级衰减）
+    5. 可选：BGE-Reranker 交叉编码器重排
+    6. 富化 + 构建结果
+    """
+    from searx.search.models import EngineRef
+
+    timing = {}
+
+    # ---------- 1. 查询改写 ----------
+    t_rewrite = default_timer()
+    query_variants = rewrite_query(query)
+    timing['rewrite_ms'] = int((default_timer() - t_rewrite) * 1000)
+    timing['query_variants'] = query_variants
+
+    # ---------- 2. 构建引擎列表 ----------
+    engine_refs = []
+    for engine_name in engine_names:
+        if engine_name in engines:
+            try:
+                cat = engines[engine_name].categories[0]
+            except Exception:
+                cat = 'general'
+            engine_refs.append(EngineRef(engine_name, cat))
+
+    if not engine_refs:
+        raise SearxParameterException('engines', 'No valid engines available')
+
+    # ---------- 3. 多查询搜索 + RRF 融合 ----------
+    t_search_start = default_timer()
+
+    ranked_lists = []
+    weights = []
+    all_suggestions = set()
+    last_container = None
+
+    for i, q_variant in enumerate(query_variants[:3]):  # 最多 3 个变体
+        try:
+            results_i, container_i = _single_query_search(q_variant, engine_refs, max_retries=2 if i > 0 else 3)
+            if results_i:
+                ranked_lists.append(results_i)
+                weights.append(1.0 if i == 0 else max(0.4, 1.0 - i * 0.25))
+            if container_i:
+                last_container = container_i
+                sug = getattr(container_i, 'suggestions', set()) or set()
+                all_suggestions.update(sug)
+        except Exception as e:
+            logger.warning(f'[SEARCH] Variant "{q_variant}" failed: {e}')
+            continue
+
+    # RRF 融合
+    if len(ranked_lists) > 1:
+        results = rrf_fuse(ranked_lists, weights=weights, limit=limit * 3)
+        timing['rrf_fused'] = True
+        timing['rrf_lists'] = len(ranked_lists)
+    elif ranked_lists:
+        results = ranked_lists[0]
+        timing['rrf_fused'] = False
+    else:
+        results = []
+        timing['rrf_fused'] = False
+
+    timing['search_ms'] = int((default_timer() - t_search_start) * 1000)
+
+    # ---------- 4. 去重、过滤 ----------
+    results = _dedupe_list_for_web(results)
+    results = _filter_low_relevance_for_web(query, results, min_score=0.1, is_web_interface=False)
+
+    # ---------- 5. ES 重排（可选） ----------
+    try:
+        if _es_ensure_index('sga'):
+            _es_bulk_index(results, 'sga')
+            scores = _es_rerank(query, 'sga')
+            if scores:
+                results.sort(key=lambda x: scores.get(_get_field(x, 'url') or '', 0), reverse=True)
+    except Exception:
+        pass
+
+    # ---------- 6. 改进的时间评分 ----------
+    # 使用新的多级时间衰减替代原有简单线性衰减
+    for r in results:
+        published = _get_field(r, 'publishedDate')
+        title = _get_field(r, 'title') or ''
+        content = _get_field(r, 'content') or ''
+        text_rel = _compute_simple_relevance_score(query, title, content)
+        tb = _time_bonus_fn(published)
+        combined = text_rel + tb
+        if isinstance(r, dict):
+            r['_rank_score'] = combined
+        else:
+            try:
+                r._rank_score = combined
+            except Exception:
+                pass
+
+    results.sort(key=lambda x: (x.get('_rank_score', 0) if isinstance(x, dict) else getattr(x, '_rank_score', 0)), reverse=True)
+
+    if sort_by_time:
+        results = _sort_results_list_by_time(results)
+
+    # ---------- 7. BGE-Reranker（可选） ----------
+    t_rerank = default_timer()
+    reranker_used = False
+    if _RERANKER_URL and results:
+        docs_for_rerank = []
+        for r in results[:30]:
+            t = _get_field(r, 'title') or ''
+            c = _get_field(r, 'content') or ''
+            docs_for_rerank.append(f'{t} {c}'[:500])
+
+        reranked_indices = _call_reranker(query, docs_for_rerank, top_k=min(limit * 2, 30))
+        if reranked_indices:
+            original = list(results[:30])
+            reranked = [original[i] for i in reranked_indices if i < len(original)]
+            # 追加未被 reranker 覆盖的结果
+            covered = set(reranked_indices)
+            remaining = [original[i] for i in range(len(original)) if i not in covered]
+            results = reranked + remaining + list(results[30:])
+            reranker_used = True
+    timing['rerank_ms'] = int((default_timer() - t_rerank) * 1000)
+    timing['reranker_used'] = reranker_used
+
+    # ---------- 8. 截断 ----------
+    results = results[:limit]
+
+    # 收集 suggestions
+    suggestions = list(all_suggestions)
+
+    # ---------- 9. 富化 ----------
+    t_enrich_start = default_timer()
+    profile = _DEPTH_PROFILES.get(depth, _DEPTH_PROFILES['basic'])
+    url2enriched = {}
+
+    if profile['enrich_top_k'] > 0:
+        urls_to_enrich = []
+        for r in results:
+            u = _get_field(r, 'url') or ''
+            if u and _host(u) not in _AGG_DOMAINS:
+                urls_to_enrich.append(u)
+                if len(urls_to_enrich) >= profile['enrich_top_k']:
+                    break
+
+        if urls_to_enrich:
+            url2enriched = _enrich_urls(
+                urls_to_enrich,
+                expand=profile['expand'],
+                top_k=profile['enrich_top_k'],
+                budget_ms=profile['enrich_timeout_ms'],
+                per_req_timeout=max(0.2, min(2.0, profile['enrich_per_req_ms'] / 1000.0)),
+                max_article_chars=profile['max_article_chars'],
+            )
+
+    timing['enrich_ms'] = int((default_timer() - t_enrich_start) * 1000)
+
+    # ---------- 10. 构建 Agent 格式的结果列表 ----------
+    agent_results = []
+    tokens = []
+    if query:
+        alnum = re.findall(r"[A-Za-z0-9]{2,}", query)
+        cjk = re.findall(r"[\u4e00-\u9fff]{1,}", query)
+        tokens = list({t.lower() for t in (alnum + cjk)})
+
+    for r in results:
+        url = _get_field(r, 'url') or ''
+        title = _get_field(r, 'title') or ''
+        content = _get_field(r, 'content') or ''
+        published = _get_field(r, 'publishedDate')
+
+        pub_str = None
+        if published:
+            try:
+                if isinstance(published, str):
+                    pub_str = published
+                else:
+                    pub_str = published.isoformat()
+            except Exception:
+                pub_str = str(published) if published else None
+
+        item = {
+            'title': title,
+            'url': url,
+            'content': content,
+            'published_date': pub_str,
+            'domain': _host(url),
+            'source_score': _source_score(url),
+        }
+
+        # 注入 RRF 分数（如果存在）
+        rrf_score = r.get('rrf_score') if isinstance(r, dict) else getattr(r, 'rrf_score', None)
+        if rrf_score is not None:
+            item['rrf_score'] = rrf_score
+
+        # 应用富化
+        enriched = url2enriched.get(url)
+        if enriched:
+            is_agg = _host(url) in _AGG_DOMAINS
+            q_score, reasons = _quality_score(url, title, content, enriched, is_agg)
+            item['quality_score'] = q_score
+            item['reason'] = reasons
+
+            if enriched.get('article'):
+                item['article'] = enriched['article']
+            if enriched.get('content_excerpt'):
+                item['content_excerpt'] = enriched['content_excerpt']
+            if enriched.get('cover_image'):
+                item['cover_image'] = enriched['cover_image']
+            images = enriched.get('images')
+            if images:
+                item['images'] = images
+            if enriched.get('author'):
+                item['author'] = enriched['author']
+            if enriched.get('site_name'):
+                item['site_name'] = enriched['site_name']
+
+            blob = enriched.get('article') or enriched.get('content_excerpt') or ''
+            if blob and tokens:
+                parts = re.split(r'[。！？.!?]\s*', blob)
+                parts = [p.strip() for p in parts if p and p.strip()]
+                hits = [s for s in parts if any(tok in s.lower() for tok in tokens)][:3]
+                if hits:
+                    item['snippet_sentences'] = hits
+        else:
+            item['quality_score'] = round(_source_score(url) * 0.6, 3)
+
+        agent_results.append(item)
+
+    # 引擎状态
+    engines_status = {}
+    for en in engine_names:
+        if en in engines:
+            engines_status[en] = {"status": "ok"}
+        else:
+            engines_status[en] = {"status": "unavailable"}
+
+    return agent_results, engines_status, suggestions, timing
+
+
+@app.route('/v1/agent/search', methods=['GET', 'POST'])
+def agent_search():
+    """Agent-friendly unified search API — 面向 AI Agent 的统一搜索入口"""
+    t_start = default_timer()
+    request_id = f"req_{_uuid.uuid4().hex[:16]}"
+
+    # 参数解析
+    query = sxng_request.form.get('q') or sxng_request.args.get('q')
+    if not query:
+        return jsonify(_agent_response_envelope(
+            status="error",
+            request_id=request_id,
+            timing={"total_ms": int((default_timer() - t_start) * 1000), "cached": False},
+            error={"code": "INVALID_QUERY", "message": "Missing required parameter: q"}
+        )), 400
+
+    query = _clean_query_string(query)
+    if not query:
+        return jsonify(_agent_response_envelope(
+            status="error",
+            request_id=request_id,
+            timing={"total_ms": int((default_timer() - t_start) * 1000), "cached": False},
+            error={"code": "INVALID_QUERY", "message": "Query is empty after cleaning"}
+        )), 400
+
+    preset = (sxng_request.form.get('preset') or sxng_request.args.get('preset') or 'chinese').lower()
+    if preset not in _PRESET_ENGINES:
+        preset = 'chinese'
+
+    sort = (sxng_request.form.get('sort') or sxng_request.args.get('sort') or 'time').lower()
+    if sort not in ('time', 'relevance'):
+        sort = 'time'
+
+    depth = (sxng_request.form.get('depth') or sxng_request.args.get('depth') or 'basic').lower()
+    if depth not in _DEPTH_PROFILES:
+        depth = 'basic'
+
+    try:
+        limit = int(sxng_request.form.get('limit') or sxng_request.args.get('limit') or 10)
+        limit = max(1, min(50, limit))
+    except (ValueError, TypeError):
+        limit = 10
+
+    # 引擎列表
+    engine_names = _PRESET_ENGINES.get(preset)
+    if engine_names is None:
+        engine_names = list(engines.keys())[:20]
+    else:
+        engine_names = list(engine_names)
+
+    # 允许 engines 参数覆盖
+    engines_param = sxng_request.form.get('engines') or sxng_request.args.get('engines')
+    if engines_param:
+        engine_names = [e.strip() for e in engines_param.split(',') if e.strip()]
+
+    # 缓存
+    cache_key = f"agent::{query}::{preset}::{limit}::{sort}::{depth}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        try:
+            resp = json.loads(cached)
+            resp['timing']['cached'] = True
+            resp['request_id'] = request_id
+            return Response(json.dumps(resp, ensure_ascii=False, separators=(',', ':')), mimetype='application/json')
+        except Exception:
+            pass
+
+    try:
+        agent_results, engines_status, suggestions, timing = _do_search_core(
+            query=query,
+            engine_names=engine_names,
+            limit=limit,
+            sort_by_time=(sort == 'time'),
+            depth=depth,
+        )
+
+        timing['total_ms'] = int((default_timer() - t_start) * 1000)
+        timing['cached'] = False
+
+        resp = _agent_response_envelope(
+            status="ok",
+            request_id=request_id,
+            timing=timing,
+            query_info={
+                "raw": query,
+                "variants": timing.pop('query_variants', [query]),
+                "preset": preset,
+                "engines_used": engine_names,
+                "sort": sort,
+                "depth": depth,
+                "rrf_fused": timing.pop('rrf_fused', False),
+                "reranker_used": timing.pop('reranker_used', False),
+            },
+            engines_status=engines_status,
+            results=agent_results,
+            total_results=len(agent_results),
+            suggestions=suggestions,
+        )
+
+        resp_json = json.dumps(resp, ensure_ascii=False, separators=(',', ':'))
+        _cache_set(cache_key, resp_json)
+        return Response(resp_json, mimetype='application/json')
+
+    except SearxParameterException as e:
+        return jsonify(_agent_response_envelope(
+            status="error", request_id=request_id,
+            timing={"total_ms": int((default_timer() - t_start) * 1000), "cached": False},
+            error={"code": "INVALID_PARAM", "message": str(e.message)}
+        )), 400
+    except Exception:
+        logger.exception('agent search error', exc_info=True)
+        return jsonify(_agent_response_envelope(
+            status="error", request_id=request_id,
+            timing={"total_ms": int((default_timer() - t_start) * 1000), "cached": False},
+            error={"code": "INTERNAL_ERROR", "message": "搜索过程中发生错误"}
+        )), 500
+
+
+@app.route('/v1/agent/health', methods=['GET'])
+def agent_health():
+    """Agent-friendly health check with capability discovery"""
+    import requests as _req_lib
+
+    # 检查 simple-crawler
+    crawler_ok = False
+    for crawler_url in ['http://localhost:3002/health', 'http://simple-crawler:3002/health']:
+        try:
+            r = _req_lib.get(crawler_url, timeout=2)
+            if r.status_code == 200:
+                crawler_ok = True
+                break
+        except Exception:
+            continue
+
+    # 检查 ES
+    es_ok = False
+    if ES_URL:
+        try:
+            resp = _es_request('GET', '_cluster/health')
+            es_ok = resp is not None
+        except Exception:
+            pass
+
+    # 引擎状态
+    engine_statuses = {}
+    for name in list(engines.keys()):
+        eng = engines[name]
+        if hasattr(eng, 'suspend_end_time') and eng.suspend_end_time and time.time() < eng.suspend_end_time:
+            engine_statuses[name] = "suspended"
+        else:
+            engine_statuses[name] = "active"
+
+    # Reranker 检查
+    reranker_ok = False
+    if _RERANKER_URL:
+        try:
+            r = _req_lib.get(f'{_RERANKER_URL.rstrip("/")}/health', timeout=2)
+            reranker_ok = r.status_code == 200
+        except Exception:
+            pass
+
+    return jsonify({
+        "status": "ok",
+        "version": VERSION_STRING,
+        "capabilities": {
+            "presets": list(_PRESET_ENGINES.keys()),
+            "depths": list(_DEPTH_PROFILES.keys()),
+            "sorts": ["time", "relevance"],
+            "max_limit": 50,
+            "crawler_available": crawler_ok,
+            "es_available": es_ok,
+            "reranker_available": reranker_ok,
+        },
+        "optimizations": {
+            "query_rewriter": True,
+            "rrf_fusion": True,
+            "time_scoring": "multi_level_decay",
+            "hotwords": get_hotwords_status(),
+            "reranker": {
+                "enabled": bool(_RERANKER_URL),
+                "url": _RERANKER_URL or None,
+                "status": "ok" if reranker_ok else ("not_configured" if not _RERANKER_URL else "unreachable"),
+            },
+        },
+        "engines": engine_statuses,
+    })
+
+
+@app.route('/v1/agent/schema', methods=['GET'])
+def agent_schema():
+    """Return OpenAPI 3.0 schema for agent tools auto-discovery"""
+    schema_path = os.path.join(os.path.dirname(__file__), 'agent_schema.json')
+    try:
+        with open(schema_path, 'r', encoding='utf-8') as f:
+            return Response(f.read(), mimetype='application/json')
+    except FileNotFoundError:
+        return jsonify({"error": "Schema file not found"}), 404
+
+
 @app.route('/about', methods=['GET'])
 def about():
     """Redirect to about page"""

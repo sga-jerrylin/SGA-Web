@@ -10,6 +10,7 @@ pyyaml==6.0.2
 requests==2.32.3
 httpx[http2]==0.28.1
 httpx-socks[asyncio]==0.10.0
+sniffio==1.3.1
 Brotli==1.1.0
 # uvloop==0.21.0  # 不支持Windows
 setproctitle==1.3.6

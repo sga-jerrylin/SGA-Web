@@ -23,7 +23,7 @@ services:
         max-file: "1"
 
   searxng:
-    build: 
+    build:
       context: .
       dockerfile: Dockerfile
     container_name: searxng
@@ -39,6 +39,10 @@ services:
       - SEARXNG_REDIS_URL=redis://redis:6379/0
       - PYTHONPATH=/usr/local/searxng
       - ES_URL=http://es:9200
+      # 可选：热词 API（SGA 热点搜索服务）
+      # - HOTWORD_API_URL=http://hotword-service:8080/api/hotwords
+      # 可选：BGE-Reranker 微服务（需要 GPU，取消注释以启用）
+      # - RERANKER_URL=http://reranker:8765
     depends_on:
       - redis
       - es
@@ -90,6 +94,31 @@ services:
         max-size: "1m"
         max-file: "1"
 
+  # ---- 可选：BGE-Reranker 微服务（需要 GPU 或大内存 CPU）----
+  # 取消注释以启用交叉编码器重排序，同时取消 searxng 的 RERANKER_URL 注释
+  # reranker:
+  #   build:
+  #     context: ./reranker
+  #     dockerfile: Dockerfile
+  #   container_name: reranker
+  #   ports:
+  #     - "8765:8765"
+  #   environment:
+  #     - MODEL_NAME=BAAI/bge-reranker-v2-m3
+  #     - MAX_LENGTH=512
+  #     - PORT=8765
+  #   restart: unless-stopped
+  #   networks:
+  #     - searxng-net
+  #   # 如果有 GPU，取消以下注释：
+  #   # deploy:
+  #   #   resources:
+  #   #     reservations:
+  #   #       devices:
+  #   #         - driver: nvidia
+  #   #           count: 1
+  #   #           capabilities: [gpu]
+
 volumes:
   redis-data:
   searxng-logs:
@@ -98,5 +127,3 @@ volumes:
 networks:
   searxng-net:
     driver: bridge
-
-  # Elasticsearch 单节点，用于 BM25 + 时间衰减重排

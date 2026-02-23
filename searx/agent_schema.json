@@ -1,0 +1,277 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "SGA-Web Agent API",
+    "version": "1.0.0",
+    "description": "SGA-Web 轻量中文搜索原子能力 API。面向 AI Agent 编排器（如 OpenClaw）设计，不引入 LLM，纯算法确定性响应。支持中文聚合搜索、微信公众号专搜、智能内容富化。"
+  },
+  "servers": [
+    {"url": "http://localhost:8888", "description": "Local development"}
+  ],
+  "paths": {
+    "/v1/agent/search": {
+      "get": {
+        "operationId": "sga_search",
+        "summary": "统一搜索入口 — 中文聚合搜索、微信公众号搜索",
+        "description": "一个端点覆盖所有搜索场景。通过 preset 切换搜索模式，通过 depth 控制信息丰富度。无 LLM，纯算法，典型延迟 basic 800-1500ms / enriched 1500-3000ms。",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": true,
+            "schema": {"type": "string"},
+            "description": "搜索关键词"
+          },
+          {
+            "name": "preset",
+            "in": "query",
+            "required": false,
+            "schema": {"type": "string", "enum": ["chinese", "wechat", "general"], "default": "chinese"},
+            "description": "搜索预设。chinese=中文聚合(sogou+baidu+360+wechat), wechat=微信公众号专搜, general=全引擎"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+            "description": "返回结果数"
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "required": false,
+            "schema": {"type": "string", "enum": ["time", "relevance"], "default": "time"},
+            "description": "排序方式。time=最新优先, relevance=相关性优先"
+          },
+          {
+            "name": "depth",
+            "in": "query",
+            "required": false,
+            "schema": {"type": "string", "enum": ["basic", "enriched"], "default": "basic"},
+            "description": "信息深度。basic=仅搜索结果(快), enriched=含正文抽取和质量评分(慢但信息丰富)"
+          },
+          {
+            "name": "engines",
+            "in": "query",
+            "required": false,
+            "schema": {"type": "string"},
+            "description": "逗号分隔引擎名，覆盖 preset 默认引擎。如: sogou,baidu"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "搜索成功",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/AgentSearchResponse"}
+              }
+            }
+          },
+          "400": {
+            "description": "参数错误",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/AgentErrorResponse"}
+              }
+            }
+          },
+          "500": {
+            "description": "内部错误",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/AgentErrorResponse"}
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "sga_search_post",
+        "summary": "统一搜索入口（POST）",
+        "description": "与 GET 相同，参数通过 form body 传递。",
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "object",
+                "required": ["q"],
+                "properties": {
+                  "q": {"type": "string"},
+                  "preset": {"type": "string", "enum": ["chinese", "wechat", "general"], "default": "chinese"},
+                  "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+                  "sort": {"type": "string", "enum": ["time", "relevance"], "default": "time"},
+                  "depth": {"type": "string", "enum": ["basic", "enriched"], "default": "basic"},
+                  "engines": {"type": "string"}
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "搜索成功",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/AgentSearchResponse"}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/agent/health": {
+      "get": {
+        "operationId": "sga_health",
+        "summary": "健康检查与能力发现",
+        "description": "返回服务状态、可用能力和引擎列表。Agent 可用此端点做能力探测和连通性检查。",
+        "responses": {
+          "200": {
+            "description": "健康状态",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/AgentHealthResponse"}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/agent/schema": {
+      "get": {
+        "operationId": "sga_schema",
+        "summary": "OpenAPI Schema（机器可读）",
+        "description": "返回本文档，供 Agent 编排器自动发现接口定义。",
+        "responses": {
+          "200": {
+            "description": "OpenAPI 3.0 JSON"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AgentSearchResponse": {
+        "type": "object",
+        "properties": {
+          "status": {"type": "string", "enum": ["ok"]},
+          "request_id": {"type": "string", "description": "请求唯一标识，用于日志追踪"},
+          "timing": {
+            "type": "object",
+            "properties": {
+              "total_ms": {"type": "integer", "description": "总耗时(ms)"},
+              "search_ms": {"type": "integer", "description": "搜索耗时(ms)"},
+              "enrich_ms": {"type": "integer", "description": "富化耗时(ms)"},
+              "cached": {"type": "boolean", "description": "是否命中缓存"}
+            }
+          },
+          "query": {
+            "type": "object",
+            "properties": {
+              "raw": {"type": "string"},
+              "preset": {"type": "string"},
+              "engines_used": {"type": "array", "items": {"type": "string"}},
+              "sort": {"type": "string"},
+              "depth": {"type": "string"}
+            }
+          },
+          "engines_status": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "status": {"type": "string", "enum": ["ok", "unavailable"]}
+              }
+            }
+          },
+          "results": {
+            "type": "array",
+            "items": {"$ref": "#/components/schemas/SearchResult"}
+          },
+          "total_results": {"type": "integer"},
+          "suggestions": {"type": "array", "items": {"type": "string"}}
+        }
+      },
+      "SearchResult": {
+        "type": "object",
+        "properties": {
+          "title": {"type": "string"},
+          "url": {"type": "string", "format": "uri"},
+          "content": {"type": "string", "description": "搜索引擎返回的摘要"},
+          "published_date": {"type": "string", "format": "date-time", "nullable": true},
+          "domain": {"type": "string"},
+          "source_score": {"type": "number", "minimum": 0, "maximum": 1, "description": "来源可信度"},
+          "quality_score": {"type": "number", "minimum": 0, "maximum": 1, "description": "内容质量评分"},
+          "article": {"type": "string", "description": "正文内容（仅 depth=enriched）"},
+          "content_excerpt": {"type": "string", "description": "内容摘要（仅 depth=enriched）"},
+          "cover_image": {"type": "string", "format": "uri", "description": "封面图（仅 depth=enriched）"},
+          "images": {"type": "array", "items": {"type": "string", "format": "uri"}, "description": "图片列表"},
+          "author": {"type": "string"},
+          "site_name": {"type": "string"},
+          "snippet_sentences": {"type": "array", "items": {"type": "string"}, "description": "命中关键词的句子"},
+          "reason": {"type": "array", "items": {"type": "string"}, "description": "质量评分依据"}
+        },
+        "required": ["title", "url", "content", "domain"]
+      },
+      "AgentErrorResponse": {
+        "type": "object",
+        "properties": {
+          "status": {"type": "string", "enum": ["error"]},
+          "request_id": {"type": "string"},
+          "timing": {"type": "object"},
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {"type": "string", "enum": ["INVALID_QUERY", "INVALID_PARAM", "NO_ENGINES", "SEARCH_TIMEOUT", "INTERNAL_ERROR"]},
+              "message": {"type": "string"}
+            }
+          }
+        }
+      },
+      "AgentHealthResponse": {
+        "type": "object",
+        "properties": {
+          "status": {"type": "string"},
+          "version": {"type": "string"},
+          "capabilities": {
+            "type": "object",
+            "properties": {
+              "presets": {"type": "array", "items": {"type": "string"}},
+              "depths": {"type": "array", "items": {"type": "string"}},
+              "sorts": {"type": "array", "items": {"type": "string"}},
+              "max_limit": {"type": "integer"},
+              "crawler_available": {"type": "boolean"},
+              "es_available": {"type": "boolean"}
+            }
+          },
+          "engines": {
+            "type": "object",
+            "additionalProperties": {"type": "string"}
+          }
+        }
+      }
+    }
+  },
+  "x-mcp-tools": [
+    {
+      "name": "sga_search",
+      "description": "中文搜索引擎原子能力。支持中文聚合搜索、微信公众号搜索。不使用LLM，纯算法确定性响应。",
+      "inputSchema": {
+        "type": "object",
+        "required": ["q"],
+        "properties": {
+          "q": {"type": "string", "description": "搜索关键词"},
+          "preset": {"type": "string", "enum": ["chinese", "wechat", "general"], "default": "chinese", "description": "搜索预设: chinese=中文聚合, wechat=微信专搜, general=全引擎"},
+          "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+          "sort": {"type": "string", "enum": ["time", "relevance"], "default": "time"},
+          "depth": {"type": "string", "enum": ["basic", "enriched"], "default": "basic", "description": "basic=仅搜索, enriched=含正文抽取"}
+        }
+      }
+    },
+    {
+      "name": "sga_health",
+      "description": "检查 SGA 搜索服务状态和可用能力",
+      "inputSchema": {"type": "object", "properties": {}}
+    }
+  ]
+}

@@ -49,7 +49,9 @@ fi\n\
 # 启动SearXNG\n\
 echo "启动 SearXNG 服务..."\n\
 echo "地址: http://0.0.0.0:8888"\n\
-echo "通用搜索API: http://0.0.0.0:8888/search"\n\
+echo "Agent API:    http://0.0.0.0:8888/v1/agent/search"\n\
+echo "Agent Health: http://0.0.0.0:8888/v1/agent/health"\n\
+echo "Agent Schema: http://0.0.0.0:8888/v1/agent/schema"\n\
 echo "中文搜索API: http://0.0.0.0:8888/chinese_search"\n\
 echo "微信专搜API: http://0.0.0.0:8888/wechat_search"\n\
 echo "容器已就绪！"\n\
